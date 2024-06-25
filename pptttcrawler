@@ -1,0 +1,197 @@
+import re
+import sys
+import json
+import os
+import requests
+import time
+from datetime import datetime, timedelta
+from bs4 import BeautifulSoup
+
+requests.packages.urllib3.disable_warnings()
+
+PttName, fileName = "", ""
+load = {
+    'from': '/bbs/' + PttName + '/index.html',
+    'yes': 'yes'
+}
+
+rs = requests.session()
+
+def getPageNumber(content):
+    startIndex = content.find('index')
+    endIndex = content.find('.html')
+    if startIndex != -1 and endIndex != -1:
+        pageNumber = content[startIndex + 5: endIndex]
+        return pageNumber
+    else:
+        return None  # 採取其他錯誤措施
+
+def over18(board):
+    res = rs.get('https://www.ptt.cc/bbs/' + board + '/index.html', verify=False)
+    if res.url.find('over18') > -1:
+        print("18禁網頁")
+        load = {
+            'from': '/bbs/' + board + '/index.html',
+            'yes': 'yes'
+        }
+        res = rs.post('https://www.ptt.cc/ask/over18', verify=False, data=load)
+        return BeautifulSoup(res.text, 'html.parser')
+    return BeautifulSoup(res.text, 'html.parser')
+
+
+
+def crawler(url_list):
+    count, g_id = 0, 0
+    total = len(url_list)
+    visited_articles = set()  # 追蹤抓取網頁
+
+    # 判斷時間
+    now = datetime.now()
+    today_9am = datetime(now.year, now.month, now.day, 9)
+    yesterday_9am = today_9am - timedelta(days=1)
+    
+    if now < today_9am:
+        today_9am = today_9am - timedelta(days=1)
+        yesterday_9am = yesterday_9am - timedelta(days=1)
+
+    while url_list:
+        url = url_list.pop(0)
+        if url in visited_articles:
+            continue  
+
+        res = rs.get(url, verify=False)
+        soup = BeautifulSoup(res.text, 'html.parser')
+
+        if soup.title.text.find('Service Temporarily') > -1:
+            url_list.append(url)
+            time.sleep(1)
+            continue
+
+        count += 1
+        for r_ent in soup.find_all(class_="r-ent"):
+            link = r_ent.find('a')
+            if link:
+                URL = 'https://www.ptt.cc' + link['href']
+                if URL in visited_articles:
+                    continue  
+
+                visited_articles.add(URL)
+                g_id += 1
+                time.sleep(0.1)
+
+                # 抓時間
+                res = rs.get(URL, verify=False)
+                soup_article = BeautifulSoup(res.text, 'html.parser')
+                date = checkformat(soup_article, '.article-meta-value', 'date', 3, URL)
+
+                timestamp_str = date
+                timestamp = datetime.strptime(timestamp_str, "%a %b %d %H:%M:%S %Y")
+                if timestamp >= today_9am:
+                    continue
+                elif timestamp < yesterday_9am:
+                    break
+                else:
+                    parseGos(URL, g_id)
+
+        print("download: " + str(100 * count / total) + " %.")
+        time.sleep(0.1)
+
+
+def checkformat(soup, class_tag, data, index, link):
+    try:
+        content = soup.select(class_tag)[index].text
+    except Exception as e:
+        print('checkformat error URL', link)
+        content = "no " + data
+    return content
+
+def parseGos(link, g_id):
+    res = rs.get(link, verify=False)
+    soup = BeautifulSoup(res.text, 'html.parser')
+
+    author = checkformat(soup, '.article-meta-value', 'author', 0, link)
+    title = checkformat(soup, '.article-meta-value', 'title', 2, link)
+    date = checkformat(soup, '.article-meta-value', 'date', 3, link)
+    
+
+
+    try:
+        targetIP = '※ 發信站: 批踢踢實業坊'
+        ip = soup.find(string=re.compile(targetIP))
+        ip = re.search(r"[0-9]*\.[0-9]*\.[0-9]*\.[0-9]*", ip).group()
+    except:
+        ip = "ip is not find"
+
+    try:
+        content = soup.find(id="main-content").text
+        target_content = '※ 發信站: 批踢踢實業坊(ptt.cc),'
+        content = content.split(target_content)
+        content = content[0].split(date)
+        main_content = content[1].replace('\n', '  ')
+    except Exception as e:
+        main_content = 'main_content error'
+        print('main_content error URL' + link)
+
+    num, g, b, n, message = 0, 0, 0, 0, {}
+
+    for tag in soup.select('div.push'):
+        try:
+            push_tag = tag.find("span", {'class': 'push-tag'}).text
+            push_userid = tag.find("span", {'class': 'push-userid'}).text
+            push_content = tag.find("span", {'class': 'push-content'}).text[1:]
+            push_ipdatetime = tag.find("span", {'class': 'push-ipdatetime'}).text.rstrip()
+
+            num += 1
+            message[num] = {"狀態": push_tag, "留言者": push_userid, "留言內容": push_content, "留言時間": push_ipdatetime}
+
+            if push_tag == '推 ':
+                g += 1
+            elif push_tag == '噓 ':
+                b += 1
+            else:
+                n += 1
+        except Exception as e:
+            print("push error URL:" + link)
+            
+
+
+    messageNum = {"g": g, "b": b, "n": n, "all": num}
+
+    d = {"a_ID": g_id, "b_作者": author, "c_標題": title, "d_日期": date, "e_ip": ip, "f_內文": main_content, "g_推文": message, "h_推文總數": messageNum}
+
+    json_data = json.dumps(d, ensure_ascii=False, indent=4, sort_keys=True) + ','
+    store(json_data)
+
+def store(data):
+    # 确保 data 文件存在
+    if not os.path.exists('data'):
+        os.makedirs('data')
+
+    with open(os.path.join('data', fileName), 'a', encoding='utf-8') as f:
+        f.write(data)
+
+if __name__ == "__main__":
+    PttName, ParsingPage = 'stock', 5  # 修改需求
+    start_time = time.time()
+    print('Start parsing ' + PttName + '....')
+    fileName = 'data-' + PttName + '-' + datetime.now().strftime('%Y%m%d%H%M%S') + '.json'
+        
+    soup = over18(PttName)
+    
+    ALLpageURL = soup.select('.btn.wide')[1]['href']
+    ALLpage = int(getPageNumber(ALLpageURL)) + 1
+    index_list = []
+    for index in range(ALLpage, ALLpage - int(ParsingPage), -1):
+        page_url = 'https://www.ptt.cc/bbs/' + PttName + '/index' + str(index) + '.html'
+        index_list.append(page_url)
+
+    store('[\n')
+    crawler(index_list)
+
+    with open(os.path.join('data', fileName), 'r', encoding='utf-8') as f:
+        content = f.read()
+    with open(os.path.join('data', fileName), 'w', encoding='utf-8') as f:
+        f.write(content[:-1] + "\n]")
+
+    print("爬蟲結束...")
+    print("execution time:" + str(time.time() - start_time) + "s")
